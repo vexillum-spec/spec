@@ -1,0 +1,113 @@
+# A complete Vexillum pipeline exercising every feature of the reference
+# implementation (StreamKanban v0.2.0). This is the kitchen sink — a real
+# pipeline would be smaller.
+vexillum: 1
+
+# ── Stages ──────────────────────────────────────────────────────────────────
+# `id` is stable forever; `label` is display and free to change. A stage with
+# an `agent` key is a station: the agent definition is agents/<name>.md, and
+# the agent's display name derives from the live label ("Dev" → "Dev agent").
+columns:
+  - id: todo
+    label: To Do
+  - id: dev
+    label: Dev
+    agent: dev
+  - id: test
+    label: Test
+    agent: test
+  - id: review
+    label: Review
+    agent: review
+  - id: merge
+    label: Merge
+    agent: merge
+  - id: done
+    label: Done
+
+# The stage whose agent integrates finished branches (merge scripts, the
+# auto-Integrator, worktree cleanup live here), and the stage that releases
+# dependent issues ("B waits until A is done/merged").
+merge_column: merge
+done_column: done
+
+# ── The planner ─────────────────────────────────────────────────────────────
+# A board-level agent, not bound to a stage: turns ideas into issues.
+planner:
+  agent: planner
+
+# ── Model routing ───────────────────────────────────────────────────────────
+# Difficulty → model. An agent with `model_by_rating: true` resolves the
+# issue's difficulty here; an unrated issue falls back to the agent's own
+# `model`; no model anywhere means the CLI's default. The difficulty
+# vocabulary describes the WORK, not who picks it up.
+models:
+  mechanical: claude-haiku-4-5
+  routine: claude-sonnet-5-5
+  involved: claude-sonnet-5-5
+  design-heavy: claude-fable-5-1
+
+# ── Run settings ────────────────────────────────────────────────────────────
+# How agents are launched on this repository. `command` is the agent CLI
+# invocation; the runner appends session and model flags. No machine paths.
+run:
+  command: claude
+  base_branch: main
+  timeout_minutes: 60
+  max_parallel: 3          # 1–8; parallel agents each get their own worktree
+  on_rate_limit: wait      # wait = park the queue until the limit lifts; or: fail
+
+# ── Rules ───────────────────────────────────────────────────────────────────
+# Everything the pipeline does on its own. A rule picks a stage, a trigger,
+# and what runs. Triggers:
+#   arrival     — a card entered the stage, by any route
+#   agent_start — just before the stage's agent spawns
+#   cleared     — the card left the stage, by any route (method-blind)
+# Actions: enqueue_agent (default) or run_script. Scripts are referenced by
+# basename from scripts/ (both platform variants required), or by `run_file`
+# as a path to a script the repository itself ships.
+rules:
+  # Work arriving in Dev starts the Dev agent.
+  - column: dev
+    trigger: arrival
+    action: enqueue_agent
+
+  # Dev and Test agents work in their own worktree, prepared by the setup
+  # script before the agent spawns.
+  - column: dev
+    trigger: agent_start
+    action: run_script
+    run: scripts/setup
+
+  - column: test
+    trigger: arrival
+    action: enqueue_agent
+
+  - column: test
+    trigger: agent_start
+    action: run_script
+    run: scripts/setup
+
+  - column: review
+    trigger: arrival
+    action: enqueue_agent
+
+  # The integration slot: arrival in Merge runs the merge script (merge,
+  # verify, clean up the worktree). On exit 0 the card moves to Done; on
+  # failure the stage's agent — the Integrator — starts with the log and
+  # resolves it, main-tree, gated to one at a time.
+  - column: merge
+    trigger: arrival
+    action: run_script
+    run: scripts/merge
+    target_column: done
+    run_agent_on_failure: true
+
+  # `cleared` example: whenever a card leaves Test — any mover, any
+  # destination — despawn its test VM. `run_file` points at a script the
+  # repository ships itself instead of the pipeline's scripts/ directory.
+  - column: test
+    trigger: cleared
+    action: run_script
+    run_file: tools/despawn-test-vm.sh
+    enabled: false         # rules ship disarmed until the team opts in
